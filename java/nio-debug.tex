@@ -1,0 +1,201 @@
+\title{Java Nio Debugging Note}
+\author{
+    Chen Luo {chenluo.cn@gmail.com}
+}
+\date{\today}
+\documentclass[12pt]{article}
+\usepackage{hyperref}
+
+% inline code
+
+% show Java code
+\usepackage{listings}
+\usepackage{color}
+
+\definecolor{dkgreen}{rgb}{0,0.6,0}
+\definecolor{gray}{rgb}{0.5,0.5,0.5}
+\definecolor{mauve}{rgb}{0.58,0,0.82}
+
+\lstset{frame=tb,
+%  language=Java,
+%  aboveskip=3mm,
+%   belowskip=3mm,
+  showstringspaces=false,
+  columns=flexible,
+  basicstyle={\small\ttfamily},
+  numbers=none,
+  numberstyle=\tiny\color{gray},
+  keywordstyle=\color{blue},
+  commentstyle=\color{dkgreen},
+  stringstyle=\color{mauve},
+  breaklines=true,
+  breakatwhitespace=false,
+%   tabsize=3
+}
+
+\begin{document}
+\maketitle
+\section{Motivation}
+\paragraph{}
+Recently, I'm learning java nio with some sample code. At first, I forget handle the case that SocketChannel.read return -1. The behavior becomes Selector.select() is always returning an event with SocketChannel.read() is -1. Then the program enters a endless loop.
+\paragraph{}
+It is mandatory to handle the above case: un-register SelectionKey or close the SocketChannel. It solves the problem. But I'd like to see what is happening without it.
+\paragraph{}
+It's not enough only debugging at Java side. When stepping into Selector.select(), EPoll.wait() is eventually a native method. And some other related method are relatively low-level.
+\paragraph{}
+I referenced the blog\cite{dbg-jdk-blog}, many QAs which are not listed here and official manual\cite{OpenJDK} to debugging the jvm itself.
+
+\section{Preparation}
+\subsection{Environment}
+I'm using Ubuntu 20.04.1 LTS. The OS dependent implementation won't be fully discussed.
+\subsection{Download source code}
+The OpenJDK uses Mercurial and the manual has a quick start guide. I'm not familiar with this vcs. I cloned the OpenJDK from \url{https://github.com/openjdk/jdk} instead. At the time I cloned, the version in master branch is 16-ea.
+
+\subsection{Build JDK}
+\label{subsec:build_jdk}
+
+As the blog shows, it need to specify the debug level to slowdebug when building the jdk. During the following instructions, some additional packages maybe missed. It's easy to follow the log and install the missed packages.
+
+\begin{verbatim}
+bash ./configure --with-target-bits=64 --with-debug-level=slowdebug
+--disable-warnings-as-errors --with-native-debug-symbols=internal
+--with-boot-jdk=[PATH_TO_EXISTING_JDK]
+
+make clean
+
+make all
+\end{verbatim}
+
+
+\subsection{Import to VSC}
+I'm using Visual Studio Code to read the C code. After run the make all command, it produces a vsc workspace file. Just open it.
+
+\subsection{Using built JDK to run Java program}
+After \ref{subsec:build_jdk}, it would be a JDK in
+\begin{verbatim}
+[JDK_SRC_DIRECTORY]/build/linux-x86_64-server-slowdebug/jdk
+\end{verbatim}
+
+\section{Run Java program and debugging by gdb}
+\subsection{Run Java program}
+\subsubsection*{Server}
+Here is the sample code. It starts a server and handle incoming connections.
+\begin{lstlisting}[language=Java]
+public void testSocketNio() throws IOException {
+        ServerSocketChannel channel = ServerSocketChannel.open();
+        channel.configureBlocking(false);
+        ServerSocket serverSocket = channel.socket();
+        serverSocket.bind(new InetSocketAddress(10901));
+        Selector selector = Selector.open();
+        channel.register(selector, SelectionKey.OP_ACCEPT);
+        try {
+
+            while (true) {
+                int eventNum = selector.select();
+                if (eventNum == 0) {
+                    continue;
+                }
+                logger.info("{} events come", eventNum);
+                Set<SelectionKey> selectionKeys = selector.selectedKeys();
+                logger.info("{}", selectionKeys);
+                Iterator<SelectionKey> iterator = selectionKeys.iterator();
+                while (iterator.hasNext()) {
+                    SelectionKey key = iterator.next();
+                    if (key.isAcceptable() && (key.readyOps() & SelectionKey.OP_ACCEPT)
+                            == SelectionKey.OP_ACCEPT) {
+                        ServerSocketChannel serverSocketChannel =
+                                (ServerSocketChannel) key.channel();
+
+                        SocketChannel socketChannel = serverSocketChannel.accept();
+                        logger.info("OP_ACCEPT from {}", socketChannel.socket().getPort());
+                        socketChannel.configureBlocking(false);
+                        SelectionKey selectionKey = socketChannel.register(selector,
+                                SelectionKey.OP_READ);
+
+                    } else if (key.isReadable() &&
+                            (key.readyOps() & SelectionKey.OP_READ) == SelectionKey.OP_READ) {
+                        SocketChannel socketChannel = (SocketChannel) key.channel();
+                        logger.info("OP_READ from {}", socketChannel.socket().getPort());
+                        ByteBuffer buffer = ByteBuffer.allocate(16);
+
+                        int readResult = socketChannel.read(buffer);
+                        if (readResult == -1) {
+                            socketChannel.socket().close();
+                            socketChannel.close();
+                            logger.warn("channel closed: {}", socketChannel.socket().getPort());
+                        } else {
+                            buffer.flip();
+                            if (buffer.hasRemaining()) {
+                                logger.info("{}:read string:{}", socketChannel.socket().getPort(),
+                                        new String(buffer.array()).trim());
+                            }
+                        }
+                        buffer.clear();
+
+                    }
+                    iterator.remove();
+                }
+                selectionKeys.clear();
+            }
+        } catch (IOException e) {
+            logger.error("", e);
+        } finally {
+            channel.close();
+        }
+
+\end{lstlisting}
+
+\subsubsection*{Client}
+I used \textbf{nc} as the client to connect and send bytes.
+\subsection{Attach Java program to gdb}
+After running the server, it's possible to attach the process to gdb by
+\textbf{gdb -p [PID]}. \textbf{jps} is helpful to find the \textbf{PID}. It will prevent the server from running when connected.
+\subsection{Set breakpoint and some instructions}
+After connected to the java process, gdb can set breakpoints by \textbf{break} instruction. It accepts many kinds formats, like method name (which is available in auto completion) and line number. It's pretty enough to break the method first and then break at line level for me. Also, gdb supports save and reload breakpoints by \textbf{save} and \textbf{source} instructions.
+
+\subsection{Attach source of glibc}
+During debugging, taking Selector.select() as example,
+it eventually invokes a method epoll\_wait.
+But it's in glibc rather JDK.
+To see the source code, following steps are necessary:
+
+\begin{enumerate}
+    \item download glibc source code via apt source glibc
+    \item attach source code in gdb via directory \lstinline{PATH_TO_GLIBC_SRC_CODE}
+\end{enumerate}
+
+Here is an sample about breakpoint in glibc:
+\begin{lstlisting}[language=c]
+(gdb) source breakpoints_nio.pts 
+Breakpoint 4 at 0x7f242c0bc8b2: file /home/chen/Applications/openjdk_15_src/jdk/src/java.base/linux/native/libnio/ch/EPoll.c, line 84.
+Breakpoint 5 at 0x7f242c0bc903: file /home/chen/Applications/openjdk_15_src/jdk/src/java.base/linux/native/libnio/ch/EPoll.c, line 87.
+Breakpoint 6 at 0x7f2456260574: /home/chen/glibc-2.31/sysdeps/unix/sysv/linux/epoll_wait.c:30. (2 locations)
+Breakpoint 7 at 0x7f242c0bd716: file /home/chen/Applications/openjdk_15_src/jdk/src/java.base/unix/native/libnio/ch/FileDispatcherImpl.c, line 299.
+
+(gdb) list epoll_wait.c:30
+26      int
+27      epoll_wait (int epfd, struct epoll_event *events, int maxevents, int timeout)
+28      {
+29      #ifdef __NR_epoll_wait
+30        return SYSCALL_CANCEL (epoll_wait, epfd, events, maxevents, timeout);
+31      #else
+32        return epoll_pwait (epfd, events, maxevents, timeout, NULL);
+33      #endif
+34      }
+
+\end{lstlisting}
+
+
+\section{TODO}
+\subsection{What's SYSCALL\_CANCEL}
+It invokes SYSCALL\_CANCEL at last. But the source code is out of glibc again. Next step is to debug into this line.
+
+\subsection{How does event/SelectionKey updated}
+Event Type: address + offset
+
+FileDescriptor: Unsafe.get 
+
+
+\bibliographystyle{plain}
+\bibliography{nio-debug}
+\end{document}
